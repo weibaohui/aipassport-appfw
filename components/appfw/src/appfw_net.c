@@ -1,10 +1,10 @@
-// main/app_net.c —— WiFi 引擎实现,契约见 app_net.h。
-#include "app_net.h"
+// components/appfw/src/appfw_net.c —— WiFi 引擎实现,契约见 app_net.h。
+#include "appfw_net.h"
 
 #include <stdio.h>
 #include <string.h>
 
-#include "app_storage.h"
+#include "appfw_storage.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -33,13 +33,13 @@ typedef enum {
 
 typedef struct {
     net_cmd_id_t id;
-    char ssid[APP_NET_SSID_LEN]; // NET_CMD_CONNECT_SSID 用
+    char ssid[APPFW_NET_SSID_LEN]; // NET_CMD_CONNECT_SSID 用
 } net_msg_t;
 
 // ---- 共享状态(自旋锁保护;LVGL 定时器/HTTP 处理器只读快照) ----
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static app_net_status_t s_status;                 // 快照主体,含扫描结果
-static app_netlist_t s_list;                      // 已保存热点(任务内可变,读侧取快照不直接用)
+static appfw_net_status_t s_status;                 // 快照主体,含扫描结果
+static appfw_netlist_t s_list;                      // 已保存热点(任务内可变,读侧取快照不直接用)
 
 // ---- 任务与同步原语 ----
 static QueueHandle_t s_queue;
@@ -60,7 +60,7 @@ static volatile bool s_expected_up; // 预期 STA 在线(connect 成功置位,�
 
 // ------------------------------------------------------------------ 状态发布
 
-static void set_state(app_net_state_t st)
+static void set_state(appfw_net_state_t st)
 {
     portENTER_CRITICAL(&s_lock);
     s_status.state = st;
@@ -69,7 +69,7 @@ static void set_state(app_net_state_t st)
 
 static void set_cur_ssid(const char *ssid)
 {
-    char tmp[APP_NET_SSID_LEN];
+    char tmp[APPFW_NET_SSID_LEN];
     snprintf(tmp, sizeof(tmp), "%s", ssid ? ssid : ""); // 锁外格式化,锁内只拷贝
     portENTER_CRITICAL(&s_lock);
     strlcpy(s_status.cur_ssid, tmp, sizeof(s_status.cur_ssid));
@@ -78,7 +78,7 @@ static void set_cur_ssid(const char *ssid)
 
 static void set_ip(const char *ip)
 {
-    char tmp[APP_NET_IP_LEN];
+    char tmp[APPFW_NET_IP_LEN];
     snprintf(tmp, sizeof(tmp), "%s", ip ? ip : "");
     portENTER_CRITICAL(&s_lock);
     strlcpy(s_status.ip, tmp, sizeof(s_status.ip));
@@ -135,7 +135,7 @@ static esp_err_t connect_one(const char *ssid, const char *pwd)
 
     xEventGroupClearBits(s_events, EV_GOT_IP | EV_STA_FAIL);
     set_cur_ssid(ssid);
-    set_state(APP_NET_CONNECTING);
+    set_state(APPFW_NET_CONNECTING);
     err = esp_wifi_connect();
     if (err != ESP_OK) return err;
 
@@ -144,12 +144,12 @@ static esp_err_t connect_one(const char *ssid, const char *pwd)
                                            pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
     if (bits & EV_GOT_IP) {
         esp_netif_ip_info_t info;
-        char ip[APP_NET_IP_LEN] = "";
+        char ip[APPFW_NET_IP_LEN] = "";
         if (esp_netif_get_ip_info(s_sta_netif, &info) == ESP_OK) {
             snprintf(ip, sizeof(ip), IPSTR, IP2STR(&info.ip));
         }
         set_ip(ip);
-        set_state(APP_NET_ONLINE);
+        set_state(APPFW_NET_ONLINE);
         s_expected_up = true;
         ESP_LOGI(TAG, "已连接 %s,IP %s", ssid, ip);
         return ESP_OK;
@@ -167,22 +167,22 @@ static esp_err_t connect_one(const char *ssid, const char *pwd)
 // 扫描并发布结果(拷入快照时统一截断 SSID,注意中文 SSID 是多字节)。
 static void do_scan(void)
 {
-    set_state(APP_NET_SCANNING);
+    set_state(APPFW_NET_SCANNING);
     xEventGroupClearBits(s_events, EV_SCAN_DONE);
     esp_err_t err = esp_wifi_scan_start(NULL, false); // 阻塞式交给事件位;NULL=默认全信道
     if (err == ESP_OK) {
         EventBits_t bits = xEventGroupWaitBits(s_events, EV_SCAN_DONE, pdTRUE, pdFALSE,
                                                pdMS_TO_TICKS(8000));
         if (bits & EV_SCAN_DONE) {
-            uint16_t count = APP_NET_SCAN_MAX;
-            wifi_ap_record_t records[APP_NET_SCAN_MAX] = { 0 };
+            uint16_t count = APPFW_NET_SCAN_MAX;
+            wifi_ap_record_t records[APPFW_NET_SCAN_MAX] = { 0 };
             // 先在锁外取完整扫描结果并整理,再短暂加锁拷入快照
             // (esp_wifi_scan_get_ap_records 内部会加自己的锁,不能嵌在自旋锁里)。
             if (esp_wifi_scan_get_ap_records(&count, records) == ESP_OK) {
-                app_net_scan_item_t items[APP_NET_SCAN_MAX];
+                appfw_net_scan_item_t items[APPFW_NET_SCAN_MAX];
                 uint8_t kept = 0;
                 for (uint16_t i = 0; i < count; i++) {
-                    snprintf(items[kept].ssid, APP_NET_SSID_LEN, "%s",
+                    snprintf(items[kept].ssid, APPFW_NET_SSID_LEN, "%s",
                              (const char *)records[i].ssid);
                     items[kept].rssi = records[i].rssi;
                     items[kept].auth = records[i].authmode != WIFI_AUTH_OPEN;
@@ -202,15 +202,15 @@ static void do_scan(void)
         ESP_LOGW(TAG, "扫描启动失败:%s", esp_err_to_name(err));
     }
     // 扫描不影响连接状态:若此前已在线,回到 ONLINE;否则回 IDLE。
-    set_state(s_expected_up ? APP_NET_ONLINE : APP_NET_IDLE);
+    set_state(s_expected_up ? APPFW_NET_ONLINE : APPFW_NET_IDLE);
 }
 
 // 整轮尝试已保存列表(点选优先)。全部失败返回 false。
 static bool try_saved_round(void)
 {
     for (uint8_t attempt = 0; attempt < s_list.count; attempt++) {
-        app_netlist_entry_t target;
-        if (!app_netlist_next_target(&s_list, attempt, &target)) break;
+        appfw_netlist_entry_t target;
+        if (!appfw_netlist_next_target(&s_list, attempt, &target)) break;
         esp_err_t err = connect_one(target.ssid, target.pwd);
         if (err == ESP_OK) return true;
     }
@@ -222,7 +222,7 @@ static bool try_saved_round(void)
 static void portal_ap_start(void)
 {
     wifi_config_t ap_cfg = { 0 };
-    char ssid[APP_NET_SSID_LEN];
+    char ssid[APPFW_NET_SSID_LEN];
     portENTER_CRITICAL(&s_lock);
     strlcpy(ssid, s_status.ap_ssid, sizeof(ssid));
     portEXIT_CRITICAL(&s_lock);
@@ -266,7 +266,7 @@ static void portal_ap_stop(void)
 // 门户请求的点选连接:成功后给 AP 一个倒计时(用户能看到"已连接"),随后自动关闭。
 static void connect_from_portal(const char *ssid)
 {
-    const app_netlist_entry_t *found = NULL;
+    const appfw_netlist_entry_t *found = NULL;
     for (uint8_t i = 0; i < s_list.count; i++) {
         if (strcmp(s_list.items[i].ssid, ssid) == 0) {
             found = &s_list.items[i];
@@ -277,8 +277,8 @@ static void connect_from_portal(const char *ssid)
         ESP_LOGW(TAG, "点选的热点不在已保存列表:%s", ssid);
         return;
     }
-    (void)app_netlist_select(&s_list, ssid);
-    (void)app_storage_save_netlist(&s_list); // 点选即持久化,重启后仍指向它
+    (void)appfw_netlist_select(&s_list, ssid);
+    (void)appfw_store_netlist_save(&s_list); // 点选即持久化,重启后仍指向它
     if (connect_one(found->ssid, found->pwd) == ESP_OK && s_status.portal_active) {
         portENTER_CRITICAL(&s_lock);
         s_status.portal_close_s = PORTAL_CLOSE_DELAY_S;
@@ -302,7 +302,7 @@ static void net_task(void *arg)
                 break;
             case NET_CMD_CONNECT_SAVED:
                 if (!try_saved_round()) {
-                    set_state(APP_NET_OFFLINE_RETRY);
+                    set_state(APPFW_NET_OFFLINE_RETRY);
                     set_cur_ssid("");
                     set_ip("");
                     last_retry = xTaskGetTickCount();
@@ -321,15 +321,15 @@ static void net_task(void *arg)
             case NET_CMD_STA_DROPPED:
                 // 意外掉线:清陈旧 IP(界面不再显示假的已连接),立即重连。
                 set_ip("");
-                set_state(APP_NET_OFFLINE_RETRY);
+                set_state(APPFW_NET_OFFLINE_RETRY);
                 if (!try_saved_round()) {
-                    set_state(APP_NET_OFFLINE_RETRY);
+                    set_state(APPFW_NET_OFFLINE_RETRY);
                     last_retry = xTaskGetTickCount();
                 }
                 continue; // 掉线重连优先于下一轮等待
             case NET_CMD_RELOAD_CONFIG:
                 // 从 NVS 重载(门户刚写入),同步 has_config 供 UI/页面判断阶段。
-                if (app_storage_load_netlist(&s_list)) {
+                if (appfw_store_netlist_load(&s_list)) {
                     portENTER_CRITICAL(&s_lock);
                     s_status.has_config = s_list.count > 0;
                     portEXIT_CRITICAL(&s_lock);
@@ -346,7 +346,7 @@ static void net_task(void *arg)
         portENTER_CRITICAL(&s_lock);
         bool portal = s_status.portal_active;
         int close_s = s_status.portal_close_s;
-        bool online = (s_status.state == APP_NET_ONLINE);
+        bool online = (s_status.state == APPFW_NET_ONLINE);
         portEXIT_CRITICAL(&s_lock);
 
         // 在线探活:状态声称在线,但驱动报告未关联 → 事件可能丢帧(如休眠
@@ -356,13 +356,13 @@ static void net_task(void *arg)
             if (esp_wifi_sta_get_ap_info(&rec) != ESP_OK) {
                 s_expected_up = false;
                 set_ip("");
-                set_state(APP_NET_OFFLINE_RETRY);
+                set_state(APPFW_NET_OFFLINE_RETRY);
                 ESP_LOGW(TAG, "探活失败:STA 已断开,开始自动重连");
                 if (!try_saved_round()) {
-                    set_state(APP_NET_OFFLINE_RETRY);
+                    set_state(APPFW_NET_OFFLINE_RETRY);
                     last_retry = xTaskGetTickCount();
                 }
-                online = (s_status.state == APP_NET_ONLINE);
+                online = (s_status.state == APPFW_NET_ONLINE);
             }
         }
 
@@ -387,7 +387,7 @@ static void net_task(void *arg)
             last_retry = xTaskGetTickCount();
             ESP_LOGI(TAG, "重试已保存热点…");
             if (try_saved_round()) continue;
-            set_state(APP_NET_OFFLINE_RETRY);
+            set_state(APPFW_NET_OFFLINE_RETRY);
         }
         // 在线时刷新 RSSI 供 UI 展示(探活成功后顺带读)。
         if (online) {
@@ -404,7 +404,15 @@ static void net_task(void *arg)
 
 // ------------------------------------------------------------------ 公开 API
 
-void app_net_get_status(app_net_status_t *out)
+appfw_net_state_t appfw_net_state(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    appfw_net_state_t st = s_status.state;
+    portEXIT_CRITICAL(&s_lock);
+    return st;
+}
+
+void appfw_net_get_status(appfw_net_status_t *out)
 {
     if (!out) return;
     portENTER_CRITICAL(&s_lock);
@@ -417,44 +425,44 @@ static bool post_cmd(net_msg_t *msg)
     return s_queue && xQueueSend(s_queue, msg, 0) == pdTRUE;
 }
 
-void app_net_start_portal(void)
+void appfw_net_start_portal(void)
 {
     net_msg_t m = { .id = NET_CMD_PORTAL_ON };
     post_cmd(&m);
 }
 
-void app_net_stop_portal(void)
+void appfw_net_stop_portal(void)
 {
     net_msg_t m = { .id = NET_CMD_PORTAL_OFF };
     post_cmd(&m);
 }
 
-void app_net_scan(void)
+void appfw_net_scan(void)
 {
     net_msg_t m = { .id = NET_CMD_SCAN };
     post_cmd(&m);
 }
 
-void app_net_connect_saved(void)
+void appfw_net_connect_saved(void)
 {
     net_msg_t m = { .id = NET_CMD_CONNECT_SAVED };
     post_cmd(&m);
 }
 
-void app_net_reload_config(void)
+void appfw_net_reload_config(void)
 {
     net_msg_t m = { .id = NET_CMD_RELOAD_CONFIG };
     post_cmd(&m);
 }
 
-void app_net_connect_ssid(const char *ssid)
+void appfw_net_connect_ssid(const char *ssid)
 {
     net_msg_t m = { .id = NET_CMD_CONNECT_SSID };
     snprintf(m.ssid, sizeof(m.ssid), "%s", ssid ? ssid : "");
     post_cmd(&m);
 }
 
-int app_net_init(const app_netlist_t *list, bool open_portal_on_no_config)
+int appfw_net_init(const appfw_netlist_t *list, bool open_portal_on_no_config)
 {
     if (s_wifi_init) return ESP_ERR_INVALID_STATE;
 
@@ -504,8 +512,8 @@ int app_net_init(const app_netlist_t *list, bool open_portal_on_no_config)
     // 配网 AP 名:前缀 + MAC 尾两字节,保证多设备不重名。
     uint8_t mac[6] = { 0 };
     esp_wifi_get_mac(WIFI_IF_STA, mac);
-    char ap_ssid[APP_NET_SSID_LEN];
-    snprintf(ap_ssid, sizeof(ap_ssid), "%s%02X%02X", APP_NET_AP_PREFIX, mac[4], mac[5]);
+    char ap_ssid[APPFW_NET_SSID_LEN];
+    snprintf(ap_ssid, sizeof(ap_ssid), "%s%02X%02X", APPFW_NET_AP_PREFIX, mac[4], mac[5]);
     portENTER_CRITICAL(&s_lock);
     strlcpy(s_status.ap_ssid, ap_ssid, sizeof(s_status.ap_ssid));
     s_status.has_config = s_list.count > 0;
@@ -525,7 +533,7 @@ int app_net_init(const app_netlist_t *list, bool open_portal_on_no_config)
     if (open_portal) {
         portal_ap_start();
     } else if (s_list.count > 0) {
-        app_net_connect_saved();
+        appfw_net_connect_saved();
     }
     return ESP_OK;
 }
